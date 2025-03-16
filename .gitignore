@@ -1,0 +1,5 @@
+# Rust build output.
+/target
+
+# Cargo lock file as this is a library.
+Cargo.lock
