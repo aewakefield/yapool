@@ -63,12 +63,17 @@ pub use object::PoolObject;
 /// ```
 pub struct Pool<M: Manager> {
     inner: Arc<PoolInner<M>>,
+    closer: Arc<PoolCloser<M>>,
 }
 
 pub struct PoolInner<M: Manager> {
     manager: M,
     slots: Slots<M::Object>,
     config: ValidPoolConfig,
+}
+
+pub struct PoolCloser<M: Manager> {
+    pool: Arc<PoolInner<M>>,
 }
 
 impl<M: Manager> Pool<M> {
@@ -78,12 +83,16 @@ impl<M: Manager> Pool<M> {
 
         let slots = Slots::new(config.max_objects);
 
+        let inner = Arc::new(PoolInner {
+            manager,
+            slots,
+            config,
+        });
         let pool = Self {
-            inner: Arc::new(PoolInner {
-                manager,
-                slots,
-                config,
+            closer: Arc::new(PoolCloser {
+                pool: inner.clone(),
             }),
+            inner,
         };
 
         for _ in 0..pool.inner.config.min_objects {
@@ -185,27 +194,9 @@ impl<M: Manager> Pool<M> {
     /// Calls currently waiting on [`Pool::acquire`] and future calls will
     /// receive a [`PoolError::Closed`] error.
     ///
-    /// If close isn't called then the objects will not be destroyed.
+    /// If close isn't called then it will be called when the pool is dropped.
     pub async fn close(&self) -> PoolResult<(), M> {
-        with_timeout(
-            self.inner.config.close_timeout,
-            self.inner
-                .slots
-                .close()
-                .into_iter()
-                .flatten()
-                .map(|slot| {
-                    // Spawning a task to ensure the object is destroyed even
-                    // if this future is cancelled.
-                    tokio::spawn({
-                        let inner = self.inner.clone();
-                        async move { inner.destroy_object_in_slot(slot).await }
-                    })
-                })
-                .collect::<JoinSet<_>>()
-                .join_all(),
-        )
-        .await?;
+        with_timeout(self.inner.config.close_timeout, self.inner.close()).await?;
         Ok(())
     }
 }
@@ -226,6 +217,24 @@ impl<M: Manager> PoolInner<M> {
                 }
             }
         });
+    }
+
+    pub async fn close(self: &Arc<Self>) {
+        self.slots
+            .close()
+            .into_iter()
+            .flatten()
+            .map(|slot| {
+                // Spawning a task to ensure the object is destroyed even
+                // if this future is cancelled.
+                tokio::spawn({
+                    let pool = self.clone();
+                    async move { pool.destroy_object_in_slot(slot).await }
+                })
+            })
+            .collect::<JoinSet<_>>()
+            .join_all()
+            .await;
     }
 
     async fn create_pool_object_from_slot(
@@ -284,7 +293,17 @@ impl<M: Manager> Clone for Pool<M> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            closer: self.closer.clone(),
         }
+    }
+}
+
+impl<M: Manager> Drop for PoolCloser<M> {
+    fn drop(&mut self) {
+        tokio::spawn({
+            let pool = self.pool.clone();
+            async move { pool.close().await }
+        });
     }
 }
 
@@ -585,11 +604,11 @@ mod tests {
         let object = pool.acquire().await.unwrap();
 
         drop(pool);
-        expect_that!(pool_inner.strong_count(), eq(1));
+        expect_that!(pool_inner.strong_count(), eq(2));
         expect_that!(pool_inner.upgrade().is_some(), eq(true));
 
         drop(object);
-        // Wait for the object to be destroyed
+        // Wait for the object to be destroyed.
         tokio::time::sleep(Duration::from_millis(100)).await;
         expect_that!(pool_inner.strong_count(), eq(0));
         expect_that!(pool_inner.upgrade().is_none(), eq(true));
@@ -748,5 +767,25 @@ mod tests {
 
         expect_that!(timeout_error, err(pat!(PoolError::Timeout)));
         expect_that!(pool.close().await, ok(()));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_close_is_called_when_pool_is_dropped() {
+        let config = PoolConfig {
+            max_objects: 1,
+            min_objects: Some(1),
+            ..Default::default()
+        };
+        let manager = TestManager::new();
+        let pool = Pool::new(manager, config).await.unwrap();
+        let pool_inner = Arc::downgrade(&pool.inner);
+
+        drop(pool);
+        // Wait for the pool to finish closing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        expect_that!(pool_inner.strong_count(), eq(0));
+        expect_that!(pool_inner.upgrade().is_none(), eq(true));
     }
 }
