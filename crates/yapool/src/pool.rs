@@ -2,7 +2,7 @@ mod config;
 mod error;
 mod object;
 
-use std::{sync::Arc, time::Duration};
+use std::{panic, sync::Arc, time::Duration};
 
 use config::ValidPoolConfig;
 use error::PoolResult;
@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 
 use crate::{
     Manager,
-    slots::{OccupiedSlot, Slot, Slots},
+    slots::{OccupiedSlot, Slot, Slots, VacantSlot},
 };
 
 pub use config::PoolConfig;
@@ -110,12 +110,32 @@ impl<M: Manager> Pool<M> {
     /// and no space to create one it will wait for an object to be released
     /// or for the pool to be closed.
     pub async fn acquire(&self) -> PoolResult<PoolObject<M>, M> {
-        let slot = with_timeout(
-            self.inner.config.acquire_timeout,
-            self.inner.slots.acquire(),
-        )
-        .await??;
-        self.inner.create_pool_object_from_slot(slot).await
+        with_timeout(self.inner.config.acquire_timeout, async {
+            let mut slot = self.inner.slots.acquire().await?;
+            loop {
+                let mut object = self.inner.create_pool_object_from_slot(slot).await?;
+                if self.inner.check_liveness(&mut object).await? {
+                    return Ok(object);
+                }
+                // Spawning a task to ensure the object is destroyed even
+                // if this future is cancelled.
+                let vacant_slot = tokio::spawn({
+                    let pool = self.clone();
+                    async move { pool.inner.destroy_object_in_slot(object.into()).await }
+                });
+                tokio::select! {
+                    // We match on Ok here so that if the join errors we wait
+                    // to acquire a new slot.
+                    Ok(vacant_slot) = async move { vacant_slot.await.map(|vacant_slot| self.inner.slots.try_upgrade(vacant_slot)) } => {
+                        slot = vacant_slot?;
+                    }
+                    acquired_slot = self.inner.slots.acquire() => {
+                        slot = acquired_slot?;
+                    }
+                }
+            }
+        })
+        .await?
     }
 
     /// Try to acquire an object from the pool. Will first try to return an
@@ -124,11 +144,40 @@ impl<M: Manager> Pool<M> {
     /// will create and return the new object. If there's no available object
     /// and no space to create one it will return `None`.
     pub async fn try_acquire(&self) -> PoolResult<Option<PoolObject<M>>, M> {
-        let slot = self.inner.slots.try_acquire()?;
-        match slot {
-            None => Ok(None),
-            Some(slot) => Ok(Some(self.inner.create_pool_object_from_slot(slot).await?)),
-        }
+        with_timeout(self.inner.config.acquire_timeout, async {
+            let mut slot = self.inner.slots.try_acquire()?;
+            loop {
+                let mut object = if let Some(slot) = slot {
+                    self.inner.create_pool_object_from_slot(slot).await?
+                } else {
+                    return Ok(None);
+                };
+                if self.inner.check_liveness(&mut object).await? {
+                    return Ok(Some(object));
+                }
+                // Spawning a task to ensure the object is destroyed even
+                // if this future is cancelled.
+                let vacant_slot = tokio::spawn({
+                    let pool = self.clone();
+                    async move { pool.inner.destroy_object_in_slot(object.into()).await }
+                });
+                tokio::select! {
+                    vacant_slot = async move { vacant_slot.await.map(|vacant_slot| self.inner.slots.try_upgrade(vacant_slot)) } => {
+                        match vacant_slot {
+                            Ok(vacant_slot) => slot = Some(vacant_slot?),
+                            // If we failed to get our vacant slot back we try
+                            // to acquire a new one. This is to ensure we don't
+                            // end up waiting for the acquire to return.
+                            Err(_) => slot = self.inner.slots.try_acquire()?,
+                        }
+                    }
+                    acquired_slot = self.inner.slots.acquire() => {
+                        slot = Some(acquired_slot?);
+                    }
+                }
+            }
+        })
+        .await?
     }
 
     /// Close the pool. Will destroy all objects currently available in the
@@ -148,7 +197,10 @@ impl<M: Manager> Pool<M> {
                 .map(|slot| {
                     // Spawning a task to ensure the object is destroyed even
                     // if this future is cancelled.
-                    tokio::spawn(self.inner.clone().destroy_object_in_slot(slot))
+                    tokio::spawn({
+                        let inner = self.inner.clone();
+                        async move { inner.destroy_object_in_slot(slot).await }
+                    })
                 })
                 .collect::<JoinSet<_>>()
                 .join_all(),
@@ -195,18 +247,25 @@ impl<M: Manager> PoolInner<M> {
             .map_err(PoolError::ManagerError)
     }
 
-    async fn destroy_object_in_slot(
-        self: Arc<Self>,
-        slot: OccupiedSlot<M::Object>,
-    ) -> PoolResult<(), M> {
-        let (object, _slot) = slot.vacate();
-        self.destroy_object(object).await
+    async fn destroy_object_in_slot(&self, slot: OccupiedSlot<M::Object>) -> VacantSlot<M::Object> {
+        let (object, slot) = slot.vacate();
+        let _ = self.destroy_object(object).await;
+        slot
     }
 
     async fn destroy_object(&self, object: M::Object) -> PoolResult<(), M> {
         with_timeout(self.config.destroy_timeout, self.manager.destroy(object))
             .await?
             .map_err(PoolError::ManagerError)
+    }
+
+    async fn check_liveness(&self, object: &mut M::Object) -> PoolResult<bool, M> {
+        with_timeout(
+            self.config.check_liveness_timeout,
+            self.manager.check_liveness(object),
+        )
+        .await?
+        .map_err(PoolError::ManagerError)
     }
 }
 
@@ -221,10 +280,18 @@ async fn with_timeout<Output>(
     }
 }
 
+impl<M: Manager> Clone for Pool<M> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicIsize, AtomicUsize, Ordering},
         time::Duration,
     };
 
@@ -239,6 +306,9 @@ mod tests {
         create_delay: Duration,
         reset_delay: Duration,
         destroy_delay: Duration,
+        check_liveness_error: Option<&'static str>,
+        check_liveness_failures: AtomicIsize,
+        check_liveness_delay: Duration,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +335,9 @@ mod tests {
                 reset_delay: Duration::from_millis(0),
                 destroy_delay: Duration::from_millis(0),
                 check_is_destroyed: true,
+                check_liveness_error: None,
+                check_liveness_failures: AtomicIsize::new(0),
+                check_liveness_delay: Duration::from_millis(0),
             }
         }
     }
@@ -298,9 +371,16 @@ mod tests {
 
         async fn check_liveness(
             &self,
-            _object: &Self::Object,
+            _object: &mut Self::Object,
         ) -> std::result::Result<bool, Self::Error> {
-            Ok(true)
+            tokio::time::sleep(self.check_liveness_delay).await;
+            if let Some(error) = self.check_liveness_error {
+                Err(error)
+            } else if self.check_liveness_failures.fetch_sub(1, Ordering::Relaxed) > 0 {
+                Ok(false)
+            } else {
+                Ok(true)
+            }
         }
     }
 
@@ -513,5 +593,160 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         expect_that!(pool_inner.strong_count(), eq(0));
         expect_that!(pool_inner.upgrade().is_none(), eq(true));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_acquire_errors_when_check_liveness_fails() {
+        let config = PoolConfig {
+            max_objects: 1,
+            ..Default::default()
+        };
+        let mut manager = TestManager::new();
+        let check_liveness_error = "Check liveness error";
+        manager.check_liveness_error = Some(check_liveness_error);
+        let pool = Pool::new(manager, config).await.unwrap();
+
+        let check_liveness_result = pool.acquire().await;
+
+        expect_that!(
+            check_liveness_result,
+            err(pat!(PoolError::ManagerError(eq(&check_liveness_error))))
+        );
+        expect_that!(pool.close().await, ok(()));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_acquire_creates_a_new_object_when_check_liveness_fails() {
+        let config = PoolConfig {
+            max_objects: 1,
+            ..Default::default()
+        };
+        let manager = TestManager::new();
+        manager.check_liveness_failures.store(1, Ordering::Relaxed);
+        let pool = Pool::new(manager, config).await.unwrap();
+
+        let object = pool.acquire().await;
+
+        expect_that!(*object.unwrap(), pat!(&TestObject { counter: eq(1) }));
+        expect_that!(pool.close().await, ok(()));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_acquire_times_out_if_keeps_failing_liveness_check() {
+        let config = PoolConfig {
+            max_objects: 1,
+            acquire_timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let manager = TestManager::new();
+        manager
+            .check_liveness_failures
+            .store(isize::MAX, Ordering::Relaxed);
+        let pool = Pool::new(manager, config).await.unwrap();
+
+        let timeout_error = pool.acquire().await;
+
+        expect_that!(timeout_error, err(pat!(PoolError::Timeout)));
+        expect_that!(pool.close().await, ok(()));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_acquire_times_out_if_check_liveness_is_slow() {
+        let config = PoolConfig {
+            max_objects: 1,
+            check_liveness_timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let mut manager = TestManager::new();
+        manager.check_liveness_delay = Duration::from_millis(200);
+        let pool = Pool::new(manager, config).await.unwrap();
+
+        let timeout_error = pool.acquire().await;
+
+        expect_that!(timeout_error, err(pat!(PoolError::Timeout)));
+        expect_that!(pool.close().await, ok(()));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_try_acquire_errors_when_check_liveness_fails() {
+        let config = PoolConfig {
+            max_objects: 1,
+            ..Default::default()
+        };
+        let mut manager = TestManager::new();
+        let check_liveness_error = "Check liveness error";
+        manager.check_liveness_error = Some(check_liveness_error);
+        let pool = Pool::new(manager, config).await.unwrap();
+
+        let check_liveness_result = pool.try_acquire().await;
+
+        expect_that!(
+            check_liveness_result,
+            err(pat!(PoolError::ManagerError(eq(&check_liveness_error))))
+        );
+        expect_that!(pool.close().await, ok(()));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_try_acquire_creates_a_new_object_when_check_liveness_fails() {
+        let config = PoolConfig {
+            max_objects: 1,
+            ..Default::default()
+        };
+        let manager = TestManager::new();
+        manager.check_liveness_failures.store(1, Ordering::Relaxed);
+        let pool = Pool::new(manager, config).await.unwrap();
+
+        let object = pool.try_acquire().await;
+
+        expect_that!(
+            *object.unwrap().unwrap(),
+            pat!(&TestObject { counter: eq(1) })
+        );
+        expect_that!(pool.close().await, ok(()));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_try_acquire_times_out_if_keeps_failing_liveness_check() {
+        let config = PoolConfig {
+            max_objects: 1,
+            acquire_timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let manager = TestManager::new();
+        manager
+            .check_liveness_failures
+            .store(isize::MAX, Ordering::Relaxed);
+        let pool = Pool::new(manager, config).await.unwrap();
+
+        let timeout_error = pool.try_acquire().await;
+
+        expect_that!(timeout_error, err(pat!(PoolError::Timeout)));
+        expect_that!(pool.close().await, ok(()));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn pool_try_acquire_times_out_if_check_liveness_is_slow() {
+        let config = PoolConfig {
+            max_objects: 1,
+            check_liveness_timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let mut manager = TestManager::new();
+        manager.check_liveness_delay = Duration::from_millis(200);
+        let pool = Pool::new(manager, config).await.unwrap();
+
+        let timeout_error = pool.try_acquire().await;
+
+        expect_that!(timeout_error, err(pat!(PoolError::Timeout)));
+        expect_that!(pool.close().await, ok(()));
     }
 }

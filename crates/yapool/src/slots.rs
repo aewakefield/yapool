@@ -56,9 +56,6 @@ impl<Object> Slots<Object> {
     }
 
     pub fn try_acquire(&self) -> SlotsResult<Option<Slot<Object>>> {
-        if self.total_slots_semaphore.is_closed() {
-            return Err(SlotsError::Closed);
-        }
         {
             let mut occupied_slots = self.occupied_slots.lock().expect(POISONED_MUTEX_ERROR);
             if let Some(slot) = occupied_slots.try_acquire()? {
@@ -93,6 +90,15 @@ impl<Object> Slots<Object> {
             self.slot_available_notifier.notify_one();
         }
         slot
+    }
+
+    pub fn try_upgrade(&self, vacant_slot: VacantSlot<Object>) -> SlotsResult<Slot<Object>> {
+        let mut occupied_slots = self.occupied_slots.lock().expect(POISONED_MUTEX_ERROR);
+        if let Some(occupied_slot) = occupied_slots.try_acquire()? {
+            Ok(Slot::Occupied(occupied_slot))
+        } else {
+            Ok(Slot::Vacant(vacant_slot))
+        }
     }
 
     #[must_use]
@@ -400,5 +406,30 @@ mod tests {
 
         let slot = slots.try_acquire();
         expect_that!(slot, err(pat!(SlotsError::Closed)));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn multiple_slots_try_upgrade_vacant_slot_when_no_occupied_slots_returns_none() {
+        let slots: Slots<usize> = Slots::new(2);
+        let slot = slots.try_acquire_vacant().unwrap().unwrap();
+
+        let upgraded = slots.try_upgrade(slot);
+
+        expect_that!(upgraded, ok(pat!(Slot::Vacant(anything()))));
+    }
+
+    #[googletest::test]
+    #[tokio::test]
+    async fn multiple_slots_try_upgrade_vacant_slot_when_occupied_slots_returns_slot() {
+        let slots: Slots<usize> = Slots::new(2);
+        let slot = slots.try_acquire_vacant().unwrap().unwrap();
+        let slot = slot.occupy(42);
+        expect_that!(slots.try_release(slot), none());
+        let slot = slots.try_acquire_vacant().unwrap().unwrap();
+
+        let upgraded = slots.try_upgrade(slot);
+
+        expect_that!(upgraded, ok(pat!(Slot::Occupied(derefs_to(eq(&42))))));
     }
 }

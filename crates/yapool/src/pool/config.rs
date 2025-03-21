@@ -30,6 +30,8 @@ pub struct PoolConfig {
     pub destroy_timeout: Option<Duration>,
     /// The timeout for closing the pool.
     pub close_timeout: Option<Duration>,
+    /// The timeout for checking if an object is still alive.
+    pub check_liveness_timeout: Option<Duration>,
 }
 
 impl Default for PoolConfig {
@@ -42,6 +44,7 @@ impl Default for PoolConfig {
             reset_timeout: None,
             destroy_timeout: None,
             close_timeout: None,
+            check_liveness_timeout: None,
         }
     }
 }
@@ -54,6 +57,7 @@ pub struct ValidPoolConfig {
     pub reset_timeout: Option<Duration>,
     pub destroy_timeout: Option<Duration>,
     pub close_timeout: Option<Duration>,
+    pub check_liveness_timeout: Option<Duration>,
 }
 
 impl PoolConfig {
@@ -82,6 +86,7 @@ impl PoolConfig {
             reset_timeout: self.reset_timeout,
             destroy_timeout: self.destroy_timeout,
             close_timeout: self.close_timeout,
+            check_liveness_timeout: self.check_liveness_timeout,
         })
     }
 }

@@ -29,7 +29,7 @@ pub trait Manager: Send + Sync + 'static {
     /// Check if an object is still alive before being acquired from the pool.
     fn check_liveness(
         &self,
-        _object: &Self::Object,
+        _object: &mut Self::Object,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         std::future::ready(Ok(true))
     }
