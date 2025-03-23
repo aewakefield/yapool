@@ -2,7 +2,7 @@ use crate::{Manager, slots::SlotsError};
 
 pub type PoolResult<T, M> = Result<T, PoolError<M>>;
 
-/// Errors that can occur when using a [`crate::Pool`].
+/// Errors that can occur when using a [`Pool`](crate::Pool).
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError<M: Manager> {
     /// Error from the [`Manager`].

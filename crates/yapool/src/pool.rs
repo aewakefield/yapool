@@ -2,7 +2,7 @@ mod config;
 mod error;
 mod object;
 
-use std::{panic, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use config::ValidPoolConfig;
 use error::PoolResult;
@@ -150,8 +150,8 @@ impl<M: Manager> Pool<M> {
     /// Try to acquire an object from the pool. Will first try to return an
     /// existing object if one is available, calling [`Manager::check_liveness`]
     /// first. If no object is available but there is space to create one it
-    /// will create and return the new object. If there's no available object
-    /// and no space to create one it will return `None`.
+    /// will create one, check it's alive and then return it. If there's no
+    /// available object and no space to create one it will return `None`.
     pub async fn try_acquire(&self) -> PoolResult<Option<PoolObject<M>>, M> {
         with_timeout(self.inner.config.acquire_timeout, async {
             let mut slot = self.inner.slots.try_acquire()?;
@@ -195,6 +195,8 @@ impl<M: Manager> Pool<M> {
     /// receive a [`PoolError::Closed`] error.
     ///
     /// If close isn't called then it will be called when the pool is dropped.
+    /// When this is called as part of dropping the pool the runtime will need
+    /// to continue running in order for the objects to be destroyed.
     pub async fn close(&self) -> PoolResult<(), M> {
         with_timeout(self.inner.config.close_timeout, self.inner.close()).await?;
         Ok(())

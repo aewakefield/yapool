@@ -7,7 +7,7 @@ use crate::slots::{OccupiedSlot, Slot};
 
 const POOL_OBJECT_SHOULD_HAVE_OCCUPIED_SLOT: &str = "Pool object should have occupied slot";
 
-/// An object managed by a [`crate::Pool`]. Will be reset and released back to the
+/// An object managed by a [`Pool`](crate::Pool). Will be reset and released back to the
 /// pool when dropped. Can be dereferenced to the inner object type.
 pub struct PoolObject<M: Manager> {
     occupied_slot: Option<OccupiedSlot<M::Object>>,
